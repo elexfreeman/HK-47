@@ -1,3 +1,4 @@
+
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { ConnectionState, LogEntry } from '../types';
@@ -239,8 +240,8 @@ export const useLiveSession = () => {
                 outputTranscriptRef.current += text;
 
                 // Parse Emotion: Look for "Emotion:" at the beginning of the text
-                // Regex looks for bold markers too just in case: **Emotion**:
-                const emotionMatch = outputTranscriptRef.current.trim().match(/^\**([А-Яа-яЁё]+)\**:/);
+                // Robust regex: Matches "Emotion:" with optional markdown stars or brackets
+                const emotionMatch = outputTranscriptRef.current.trim().match(/^[\*\[]*([А-Яа-яЁё]+)[\*\]]*:/);
                 
                 if (emotionMatch && emotionMatch[1]) {
                    const rawEmotion = emotionMatch[1].toLowerCase();
