@@ -102,7 +102,7 @@ export const Visualizer: React.FC<VisualizerProps> = ({ isActive, volume }) => {
   return (
     <canvas 
       ref={canvasRef} 
-      className="w-full h-64 border-y border-red-900 bg-black bg-opacity-50"
+      className="w-full h-full border-y border-red-900 bg-black bg-opacity-50 object-cover"
     />
   );
 };
