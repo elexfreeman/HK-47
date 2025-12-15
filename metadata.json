@@ -1,0 +1,7 @@
+{
+  "name": "HK-47 Assassin Droid Interface",
+  "description": "A voice-activated interface for the HK-47 assassin droid, utilizing Gemini Live API for real-time interaction.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
