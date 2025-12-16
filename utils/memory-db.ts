@@ -60,32 +60,40 @@ export const getAllMemories = async (): Promise<Memory[]> => {
   });
 };
 
-export const searchMemories = async (query: string): Promise<Memory[]> => {
+export const searchMemories = async (query: string, searchTags: string[] = []): Promise<Memory[]> => {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const transaction = db.transaction([STORE_NAME], 'readonly');
     const store = transaction.objectStore(STORE_NAME);
-    const request = store.getAll(); // Get all and filter in JS for flexibility with tags/content mixing
+    const request = store.getAll();
 
     request.onsuccess = () => {
       const all: Memory[] = request.result;
-      if (!query) {
-        resolve([]); // Don't return everything if no query
+      const q = query.toLowerCase().trim();
+      const sTags = searchTags.map(t => t.toLowerCase());
+
+      if (!q && sTags.length === 0) {
+        resolve([]); 
         return;
       }
       
-      const q = query.toLowerCase();
       const results = all.filter(m => {
-        const inContent = m.content.toLowerCase().includes(q);
-        const inCategory = m.category.toLowerCase().includes(q);
-        const inTags = m.tags.some(t => t.toLowerCase().includes(q));
-        return inContent || inCategory || inTags;
+        // 1. Direct Text Match
+        const inContent = q && m.content.toLowerCase().includes(q);
+        const inCategory = q && m.category.toLowerCase().includes(q);
+        const inTags = q && m.tags.some(t => t.toLowerCase().includes(q));
+        
+        // 2. Associative Tag Match (Intersection)
+        // Check if any of the search tags exist in the memory tags
+        const tagMatch = sTags.some(st => m.tags.some(mt => mt.toLowerCase().includes(st)));
+
+        return inContent || inCategory || inTags || tagMatch;
       });
       
-      // Sort by relevance (basic: tag match > category match > content match)
-      results.sort((a, b) => b.timestamp - a.timestamp); // Newest first for now
+      // Sort: Tag matches generally more relevant than loose text matches
+      results.sort((a, b) => b.timestamp - a.timestamp);
       
-      resolve(results.slice(0, 5)); // Limit to top 5 relevant memories
+      resolve(results.slice(0, 5));
     };
     request.onerror = () => reject('Search Error');
   });

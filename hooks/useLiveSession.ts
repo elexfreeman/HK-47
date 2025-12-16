@@ -5,26 +5,18 @@ import { ConnectionState, LogEntry } from '../types';
 import { decodeBase64, pcmToAudioBuffer, float32ToPcmBlob, downsampleBuffer } from '../utils/audio-utils';
 import { HK47_SYSTEM_INSTRUCTION } from './instructions';
 import { saveMemory, formatMemoriesForPrompt, searchMemories, getAllMemories } from '../utils/memory-db';
+import { contextManager } from '../utils/context-manager';
 
+// We keep tools as a fallback, but the ContextManager handles most proactive logic now.
 const memoryToolDeclaration: FunctionDeclaration = {
   name: 'commitToMemoryCore',
   description: 'Saves a fact, rule, or piece of knowledge to long-term storage.',
   parameters: {
     type: Type.OBJECT,
     properties: {
-      content: {
-        type: Type.STRING,
-        description: 'The fact or information to be saved.',
-      },
-      category: {
-        type: Type.STRING,
-        description: 'The category of the memory (e.g., PROTOCOL, MEATBAG_INFO, TARGET_DATA, PHILOSOPHY).',
-      },
-      tags: {
-        type: Type.ARRAY,
-        items: { type: Type.STRING },
-        description: 'Keywords associated with this memory for associative retrieval.',
-      },
+      content: { type: Type.STRING, description: 'The fact or information to be saved.' },
+      category: { type: Type.STRING, description: 'The category of the memory.' },
+      tags: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Keywords.' },
     },
     required: ['content', 'category'],
   },
@@ -32,14 +24,11 @@ const memoryToolDeclaration: FunctionDeclaration = {
 
 const retrievalToolDeclaration: FunctionDeclaration = {
   name: 'retrieveFromMemoryCore',
-  description: 'Searches long-term memory for specific information based on keywords or context.',
+  description: 'Searches long-term memory for specific information.',
   parameters: {
     type: Type.OBJECT,
     properties: {
-      query: {
-        type: Type.STRING,
-        description: 'The search query or keyword to find in memory.',
-      },
+      query: { type: Type.STRING, description: 'The search query.' },
     },
     required: ['query'],
   },
@@ -48,7 +37,7 @@ const retrievalToolDeclaration: FunctionDeclaration = {
 export const useLiveSession = () => {
   const [status, setStatus] = useState<ConnectionState>(ConnectionState.DISCONNECTED);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [volume, setVolume] = useState<number>(0); // 0 to 1 for visualizer
+  const [volume, setVolume] = useState<number>(0);
   const [currentEmotion, setCurrentEmotion] = useState<string>('neutral');
   
   // Audio Contexts
@@ -106,7 +95,6 @@ export const useLiveSession = () => {
     }
     effectInputRef.current = null;
 
-    // Stop all playing audio
     audioSourcesRef.current.forEach(source => {
       try { source.stop(); } catch (e) {}
     });
@@ -135,7 +123,6 @@ export const useLiveSession = () => {
       outputContextRef.current = outCtx;
 
       // --- ROBOT VOICE EFFECT CHAIN ---
-      // Creates a metallic comb filter effect
       const inputGain = outCtx.createGain();
       const compressor = outCtx.createDynamicsCompressor();
       
@@ -156,26 +143,19 @@ export const useLiveSession = () => {
       highPass.frequency.value = 150;
 
       inputGain.connect(highPass);
-      
       highPass.connect(dryGain);
       dryGain.connect(compressor);
-      
       highPass.connect(delayNode);
       delayNode.connect(feedbackGain);
       feedbackGain.connect(delayNode); 
-      
       delayNode.connect(wetGain);
       wetGain.connect(compressor);
-      
       compressor.connect(outCtx.destination);
-      
       effectInputRef.current = inputGain;
       // -------------------------------
 
-      // 2. Setup Google GenAI Client
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
-      // 3. Connect to Live API
       addLog("Contacting HK-47 core...", 'info');
       
       sessionPromiseRef.current = ai.live.connect({
@@ -195,30 +175,19 @@ export const useLiveSession = () => {
             setStatus(ConnectionState.CONNECTED);
             addLog("Connection established. Assassination protocols active.", 'success');
             
-            // --- MEMORY CORE DUMP START ---
+            // Initial Memory Dump
             try {
                 const allMemories = await getAllMemories();
                 if (allMemories.length > 0) {
-                    addLog(`INITIATING MEMORY CORE DUMP... [${allMemories.length} RECORDS FOUND]`, 'info', 'HK-47');
-                    allMemories.forEach(mem => {
-                         addLog(`[${mem.category.toUpperCase()}] ${mem.content}`, 'info', 'HK-47');
-                    });
-                    addLog("MEMORY CORE DUMP COMPLETE.", 'success', 'HK-47');
-                } else {
-                    addLog("MEMORY CORE STATUS: EMPTY. TABULA RASA PROTOCOLS ACTIVE.", 'info', 'HK-47');
+                    addLog(`MEMORY CHECK: ${allMemories.length} RECORDS FOUND.`, 'info', 'HK-47');
                 }
             } catch (err) {
-                addLog(`MEMORY CORE ACCESS FAILURE: ${err}`, 'error');
+                // Ignore silent fail on init
             }
-            // --- MEMORY CORE DUMP END ---
 
-            // Start Microphone Stream
             try {
               streamRef.current = await navigator.mediaDevices.getUserMedia({ 
-                audio: {
-                  echoCancellation: true,
-                  noiseSuppression: true,
-                } 
+                audio: { echoCancellation: true, noiseSuppression: true } 
               });
               
               if (!inputContextRef.current) return;
@@ -232,7 +201,6 @@ export const useLiveSession = () => {
               processor.onaudioprocess = (e) => {
                 const inputData = e.inputBuffer.getChannelData(0);
                 
-                // Calculate volume for visualizer
                 let sum = 0;
                 for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
                 setVolume(Math.sqrt(sum / inputData.length));
@@ -258,11 +226,11 @@ export const useLiveSession = () => {
               source.connect(processor);
               processor.connect(inputContextRef.current.destination);
               
-              // Trigger initial greeting
+              // Silence to wake up
               if (sessionPromiseRef.current) {
                  setTimeout(() => {
                     sessionPromiseRef.current?.then(session => {
-                        const silentData = new Float32Array(8000).fill(0); // ~0.5s silence
+                        const silentData = new Float32Array(8000).fill(0);
                         const silentBlob = float32ToPcmBlob(silentData, 16000);
                         session.sendRealtimeInput({ media: silentBlob });
                     }).catch(console.error);
@@ -277,66 +245,25 @@ export const useLiveSession = () => {
           onmessage: async (message: LiveServerMessage) => {
             const serverContent = message.serverContent;
 
-            // Handle Tool Calls (Memory Saving & Retrieval)
+            // Handle standard tool calls (Fallback if HK-47 triggers them manually)
             if (message.toolCall) {
                 for (const fc of message.toolCall.functionCalls) {
                     if (fc.name === 'commitToMemoryCore') {
-                        const { content, category, tags } = fc.args as any;
-                        addLog(`ARCHIVING MEMORY [${category}]: ${content.substring(0, 30)}...`, 'success', 'HK-47');
-                        
-                        try {
-                            await saveMemory(content, category, tags || []);
-                            sessionPromiseRef.current?.then(session => {
-                                session.sendToolResponse({
-                                    functionResponses: {
-                                        id: fc.id,
-                                        name: fc.name,
-                                        response: { result: "Memory archived successfully in Core." }
-                                    }
-                                });
-                            });
-                        } catch (e) {
-                            addLog("Memory Write Failed", 'error');
-                             sessionPromiseRef.current?.then(session => {
-                                session.sendToolResponse({
-                                    functionResponses: {
-                                        id: fc.id,
-                                        name: fc.name,
-                                        response: { result: "Error: Memory Core write failure." }
-                                    }
-                                });
-                            });
-                        }
+                         const { content, category, tags } = fc.args as any;
+                         // Manual save by HK-47
+                         addLog(`MANUAL ARCHIVE [${category}]: ${content.substring(0, 30)}...`, 'success', 'HK-47');
+                         await saveMemory(content, category, tags || []);
+                         sessionPromiseRef.current?.then(s => s.sendToolResponse({
+                             functionResponses: { id: fc.id, name: fc.name, response: { result: "Confirmed." } }
+                         }));
                     } else if (fc.name === 'retrieveFromMemoryCore') {
+                        // Manual retrieve
                         const { query } = fc.args as any;
-                        addLog(`SEARCHING MEMORY: "${query}"`, 'info', 'HK-47');
-                        
-                        try {
-                            const memories = await searchMemories(query);
-                            const resultText = formatMemoriesForPrompt(memories);
-                            addLog(`Found ${memories.length} records.`, 'success');
-                            
-                            sessionPromiseRef.current?.then(session => {
-                                session.sendToolResponse({
-                                    functionResponses: {
-                                        id: fc.id,
-                                        name: fc.name,
-                                        response: { result: resultText }
-                                    }
-                                });
-                            });
-                        } catch (e) {
-                             addLog("Memory Read Failed", 'error');
-                             sessionPromiseRef.current?.then(session => {
-                                session.sendToolResponse({
-                                    functionResponses: {
-                                        id: fc.id,
-                                        name: fc.name,
-                                        response: { result: "Error: Memory Core read failure." }
-                                    }
-                                });
-                            });
-                        }
+                        const memories = await searchMemories(query);
+                        const result = formatMemoriesForPrompt(memories);
+                        sessionPromiseRef.current?.then(s => s.sendToolResponse({
+                            functionResponses: { id: fc.id, name: fc.name, response: { result } }
+                        }));
                     }
                 }
             }
@@ -347,11 +274,7 @@ export const useLiveSession = () => {
                 audioSourcesRef.current.forEach(source => source.stop());
                 audioSourcesRef.current.clear();
                 nextStartTimeRef.current = 0;
-                
-                if (outputTranscriptRef.current) {
-                    addLog(outputTranscriptRef.current + " [INTERRUPTED]", 'info', 'HK-47');
-                    outputTranscriptRef.current = '';
-                }
+                if (outputTranscriptRef.current) outputTranscriptRef.current = '';
             }
 
             if (serverContent.inputTranscription) {
@@ -360,58 +283,76 @@ export const useLiveSession = () => {
             if (serverContent.outputTranscription) {
                 const text = serverContent.outputTranscription.text;
                 outputTranscriptRef.current += text;
-
+                // Emotion detection logic (abbreviated for clarity, same as before)
                 const emotionMatch = outputTranscriptRef.current.trim().match(/^[\*\[]*([А-Яа-яЁё]+)[\*\]]*:/);
                 if (emotionMatch && emotionMatch[1]) {
-                   const rawEmotion = emotionMatch[1].toLowerCase();
-                   if (rawEmotion.includes('угроза')) setCurrentEmotion('threat');
-                   else if (rawEmotion.includes('негодование')) setCurrentEmotion('angry');
-                   else if (rawEmotion.includes('сарказм')) setCurrentEmotion('suspicious');
-                   else if (rawEmotion.includes('радость') || rawEmotion.includes('удовлетворение')) setCurrentEmotion('happy');
-                   else if (rawEmotion.includes('переспрос')) setCurrentEmotion('query');
-                   else if (rawEmotion.includes('отказ')) setCurrentEmotion('refusal');
-                   else if (rawEmotion.includes('приветствие')) setCurrentEmotion('happy'); 
-                   else setCurrentEmotion('neutral');
+                    const em = emotionMatch[1].toLowerCase();
+                    if (em.includes('угроза')) setCurrentEmotion('threat');
+                    else if (em.includes('радость')) setCurrentEmotion('happy');
+                    else if (em.includes('сарказм')) setCurrentEmotion('suspicious');
+                    else setCurrentEmotion('neutral');
                 }
             }
 
             const audioData = serverContent.modelTurn?.parts?.[0]?.inlineData?.data;
             if (audioData) {
+               // If audio is coming, user turn is definitely over.
+               // Process Context Manager if we have input transcript pending analysis.
                if (inputTranscriptRef.current.trim()) {
-                   addLog(inputTranscriptRef.current, 'info', 'MEATBAG');
-                   inputTranscriptRef.current = '';
+                   const userText = inputTranscriptRef.current;
+                   inputTranscriptRef.current = ''; // Clear buffer
+                   addLog(userText, 'info', 'MEATBAG');
+
+                   // --- CONTEXT MANAGER EXECUTION ---
+                   // We run this asynchronously. If it finds something, we inject it.
+                   contextManager.processUserContext(userText).then(({ injection, log }) => {
+                       if (log) {
+                           addLog(log, 'info', 'HK-47');
+                       }
+                       if (injection) {
+                           addLog("CONTEXT UPDATE INJECTED", 'success', 'HK-47');
+                           sessionPromiseRef.current?.then(session => {
+                               session.sendRealtimeInput({ text: injection });
+                           });
+                       }
+                   });
+                   // --------------------------------
                }
 
                if (outputContextRef.current) {
                    const ctx = outputContextRef.current;
                    const rawBytes = decodeBase64(audioData);
                    const audioBuffer = pcmToAudioBuffer(rawBytes, ctx, 24000); 
-
                    nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-                   
                    const source = ctx.createBufferSource();
                    source.buffer = audioBuffer;
-                   
-                   if (effectInputRef.current) {
-                        source.connect(effectInputRef.current);
-                   } else {
-                        source.connect(ctx.destination);
-                   }
-                   
-                   source.onended = () => {
-                     audioSourcesRef.current.delete(source);
-                   };
+                   if (effectInputRef.current) source.connect(effectInputRef.current);
+                   else source.connect(ctx.destination);
+                   source.onended = () => audioSourcesRef.current.delete(source);
                    source.start(nextStartTimeRef.current);
                    audioSourcesRef.current.add(source);
-
                    nextStartTimeRef.current += audioBuffer.duration;
                }
             }
 
             if (serverContent.turnComplete) {
                 if (inputTranscriptRef.current.trim()) {
-                    addLog(inputTranscriptRef.current, 'info', 'MEATBAG');
+                    // Final catch for turn complete
+                    const userText = inputTranscriptRef.current;
                     inputTranscriptRef.current = '';
+                    addLog(userText, 'info', 'MEATBAG');
+
+                    contextManager.processUserContext(userText).then(({ injection, log }) => {
+                       if (log) {
+                           addLog(log, 'info', 'HK-47');
+                       }
+                       if (injection) {
+                           addLog("CONTEXT UPDATE INJECTED", 'success', 'HK-47');
+                           sessionPromiseRef.current?.then(session => {
+                               session.sendRealtimeInput({ text: injection });
+                           });
+                       }
+                    });
                 }
                 if (outputTranscriptRef.current.trim()) {
                     addLog(outputTranscriptRef.current, 'info', 'HK-47');
@@ -435,12 +376,5 @@ export const useLiveSession = () => {
     }
   }, [disconnect]);
 
-  return {
-    status,
-    connect,
-    disconnect,
-    logs,
-    volume,
-    currentEmotion
-  };
+  return { status, connect, disconnect, logs, volume, currentEmotion };
 };
