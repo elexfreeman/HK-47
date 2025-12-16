@@ -671,14 +671,13 @@ export const HK47_SYSTEM_INSTRUCTION = `
 `;
 
 export const getRandomThinkingPrompt = () => {
-  const phrases = [
-    "Analysis: Processing input parameters...",
-    "Query: Accessing memory core...",
-    "Statement: Stand by, meatbag. Verifying data...",
-    "Advisement: Pausing for tactical analysis...",
-    "Processing: Decrypting context...",
-    "Observation: Scanning archives...",
-  ];
+const phrases = [
+  "Анализ: обработка входных параметров...",
+  "Запрос: доступ к ядру памяти...", 
+  "Рекомендация: пауза для тактического анализа...",
+  "Обработка: расшифровка контекста...",
+  "Наблюдение: сканирование архивов...",
+];
   const phrase = phrases[Math.floor(Math.random() * phrases.length)];
   return `[SYSTEM COMMAND: IMMEDIATELY interrupt current speech. Speak the following phrase to fill silence: "${phrase}". Do not answer the user's question yet. Wait for data.]`;
 };

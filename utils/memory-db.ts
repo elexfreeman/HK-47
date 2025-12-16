@@ -1,110 +1,305 @@
 
 export interface Memory {
-  id?: number;
+  id?: string | number;
   content: string;
   category: string;
   tags: string[];
-  timestamp: number;
+  created_ms: number; 
 }
 
-const DB_NAME = 'HK47_Memory_Core';
-const STORE_NAME = 'memories';
-const DB_VERSION = 1;
+// Configuration
+const DB_URL = process.env.HK_DB_URL || 'wss://some-network.ru/ws';
+const DB_USER = process.env.HK_DB_USER || 'admin';
+const DB_PASS = process.env.HK_DB_PASS || 'password';
+const PARTITION = 'dev-db';
 
-export const openDB = (): Promise<IDBDatabase> => {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
+// --- Logging System ---
+type LogCallback = (message: string, type: 'info' | 'error' | 'success') => void;
+const listeners: LogCallback[] = [];
 
-    request.onerror = (event) => reject('Memory Core Corruption: ' + (event.target as any).error);
-
-    request.onsuccess = (event) => resolve((event.target as IDBOpenDBRequest).result);
-
-    request.onupgradeneeded = (event) => {
-      const db = (event.target as IDBOpenDBRequest).result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        const store = db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
-        store.createIndex('category', 'category', { unique: false });
-        store.createIndex('tags', 'tags', { unique: false, multiEntry: true });
-      }
-    };
-  });
+export const subscribeToMemoryLogs = (callback: LogCallback) => {
+  listeners.push(callback);
+  return () => {
+    const index = listeners.indexOf(callback);
+    if (index > -1) listeners.splice(index, 1);
+  };
 };
 
-export const saveMemory = async (content: string, category: string, tags: string[]): Promise<number> => {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], 'readwrite');
-    const store = transaction.objectStore(STORE_NAME);
-    const memory: Memory = {
-      content,
-      category,
-      tags,
-      timestamp: Date.now(),
-    };
-    const request = store.add(memory);
+const emitLog = (message: string, type: 'info' | 'error' | 'success' = 'info') => {
+  listeners.forEach(cb => cb(message, type));
+  if (type === 'error') console.error(`[MemoryDB] ${message}`);
+  else console.log(`[MemoryDB] ${message}`);
+};
 
-    request.onsuccess = () => resolve(request.result as number);
-    request.onerror = () => reject('Write Error');
-  });
+class MemoryDBClient {
+  private ws: WebSocket | null = null;
+  private queue: Array<() => Promise<any>> = [];
+  private isProcessing = false;
+  private isAuthenticated = false;
+  
+  // Handlers for the current active request
+  private pendingResolver: ((val: any) => void) | null = null;
+  private pendingRejecter: ((reason: any) => void) | null = null;
+
+  constructor() {}
+
+  private async connect(): Promise<void> {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.isAuthenticated) {
+      return;
+    }
+
+    // Force clean state if retrying
+    if (this.ws) {
+        try { this.ws.close(); } catch(e) {}
+        this.ws = null;
+    }
+    this.isAuthenticated = false;
+
+    emitLog("Initiating subspace uplink to Memory Core...", 'info');
+
+    return new Promise((resolve, reject) => {
+      try {
+        this.ws = new WebSocket(DB_URL);
+      } catch (e: any) {
+        const err = `Secure Protocol Error: ${e.message}`;
+        emitLog(err, 'error');
+        return reject(e);
+      }
+
+      this.ws.onopen = () => {
+        emitLog("Uplink established. Transmitting auth codes...", 'info');
+        // Protocol Step 2: Send Auth
+        this.sendRaw({
+            type: 'auth',
+            login: DB_USER,
+            password: DB_PASS
+        });
+      };
+
+      this.ws.onmessage = (event) => {
+        try {
+            const msg = JSON.parse(event.data);
+            
+            // Auth Handshake
+            if (msg.type === 'auth_ok') {
+                this.isAuthenticated = true;
+                emitLog("Memory Core access: GRANTED.", 'success');
+                resolve();
+                return;
+            }
+            if (msg.type === 'error' && !this.isAuthenticated) {
+                emitLog(`Auth Failure: ${msg.message}`, 'error');
+                reject(new Error(`HK-DB Auth Failure: ${msg.message}`));
+                return;
+            }
+
+            // Operation Responses
+            if (this.pendingResolver) {
+                if (msg.type === 'error') {
+                     emitLog(`Operation Error: ${msg.message}`, 'error');
+                     if (this.pendingRejecter) this.pendingRejecter(new Error(msg.message));
+                } else {
+                     this.pendingResolver(msg);
+                }
+                // Cleanup
+                this.pendingResolver = null;
+                this.pendingRejecter = null;
+            }
+        } catch (e) {
+            console.error("HK-DB Parse Error", e);
+        }
+      };
+
+      this.ws.onerror = (e) => {
+        console.error("HK-DB Socket Error", e);
+        emitLog("Memory Core socket malfunction.", 'error');
+        if (!this.isAuthenticated) {
+            reject(new Error("WebSocket Connection Failed"));
+        } else if (this.pendingRejecter) {
+            this.pendingRejecter(new Error("WebSocket Connection Error during request"));
+            this.pendingResolver = null;
+            this.pendingRejecter = null;
+        }
+      };
+
+      this.ws.onclose = () => {
+        if (this.isAuthenticated) {
+            emitLog("Memory Core uplink terminated.", 'info');
+        }
+        
+        if (!this.isAuthenticated) {
+            reject(new Error("HK-DB Connection Closed before Auth"));
+        }
+
+        this.isAuthenticated = false;
+        
+        if (this.pendingRejecter) {
+            this.pendingRejecter(new Error("HK-DB Connection Closed"));
+            this.pendingResolver = null;
+            this.pendingRejecter = null;
+        }
+      };
+    });
+  }
+
+  private sendRaw(data: any) {
+     // if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify(data));
+      //}
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+      return new Promise((resolve, reject) => {
+          this.queue.push(async () => {
+              try {
+                  await this.connect();
+                  const result = await operation();
+                  resolve(result);
+              } catch (e) {
+                  reject(e);
+              }
+          });
+          this.processQueue();
+      });
+  }
+
+  private async processQueue() {
+      if (this.isProcessing) return;
+      this.isProcessing = true;
+
+      while (this.queue.length > 0) {
+          const task = this.queue.shift();
+          if (task) await task();
+      }
+
+      this.isProcessing = false;
+  }
+
+  // --- Public Operations ---
+
+  public async insert(content: string, category: string, tags: string[]): Promise<string> {
+      emitLog(`Archiving to sector [${category}]: "${content.substring(0, 20)}..."`, 'info');
+      return this.enqueue(async () => {
+          return new Promise((resolve, reject) => {
+              this.pendingResolver = (msg: any) => {
+                  if (msg.type === 'inserted') {
+                      emitLog(`Archive confirmed. ID: ${msg.id}`, 'success');
+                      resolve(msg.id);
+                  }
+                  else reject(new Error('Unexpected response: ' + msg.type));
+              };
+              this.pendingRejecter = reject;
+
+              this.sendRaw({
+                  type: 'insert',
+                  partition: PARTITION,
+                  data: content,
+                  tags: tags,
+                  categories: [category]
+              });
+          });
+      });
+  }
+
+  public async fetchAll(): Promise<Memory[]> {
+      emitLog("Initiating full memory dump...", 'info');
+      return this.enqueue(async () => {
+          return new Promise((resolve, reject) => {
+              this.pendingResolver = (msg: any) => {
+                  if (msg.type === 'search_results') {
+                      const memories = this.mapItemsToMemory(msg.items);
+                      emitLog(`Memory dump complete. ${memories.length} records found.`, 'success');
+                      resolve(memories);
+                  } else {
+                      reject(new Error('Unexpected response: ' + msg.type));
+                  }
+              };
+              this.pendingRejecter = reject;
+
+              this.sendRaw({
+                  type: 'search',
+                  partition: PARTITION,
+                  tags: [],
+                  categories: []
+              });
+          });
+      });
+  }
+  
+  private mapItemsToMemory(items: any[]): Memory[] {
+      if (!Array.isArray(items)) return [];
+      return items.map(item => ({
+          id: item.id,
+          content: item.data,
+          category: item.categories?.[0] || 'Unknown',
+          tags: item.tags || [],
+          created_ms: item.created_ms || Date.now()
+      }));
+  }
+}
+
+const db = new MemoryDBClient();
+
+// --- Exported Helper Functions ---
+
+export const saveMemory = async (content: string, category: string, tags: string[]): Promise<string> => {
+  try {
+      return await db.insert(content, category, tags);
+  } catch (error: any) {
+      emitLog(`Write Protocol Failed: ${error.message}`, 'error');
+      return "offline-id-" + Date.now();
+  }
 };
 
 export const getAllMemories = async (): Promise<Memory[]> => {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], 'readonly');
-    const store = transaction.objectStore(STORE_NAME);
-    const request = store.getAll();
-
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject('Read Error');
-  });
+  try {
+      return await db.fetchAll();
+  } catch (error: any) {
+      emitLog(`Read Protocol Failed: ${error.message}`, 'error');
+      return [];
+  }
 };
 
 export const searchMemories = async (query: string, searchTags: string[] = []): Promise<Memory[]> => {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], 'readonly');
-    const store = transaction.objectStore(STORE_NAME);
-    const request = store.getAll();
-
-    request.onsuccess = () => {
-      const all: Memory[] = request.result;
+  try {
+      if (query || searchTags.length > 0) {
+          emitLog(`Searching archives: "${query}" ${searchTags.length ? `[${searchTags.join(',')}]` : ''}`, 'info');
+      }
+      
+      const allMemories = await db.fetchAll();
+      
       const q = query.toLowerCase().trim();
       const sTags = searchTags.map(t => t.toLowerCase());
 
-      if (!q && sTags.length === 0) {
-        resolve([]); 
-        return;
-      }
-      
-      const results = all.filter(m => {
-        // 1. Direct Text Match
+      if (!q && sTags.length === 0) return [];
+
+      const results = allMemories.filter(m => {
         const inContent = q && m.content.toLowerCase().includes(q);
         const inCategory = q && m.category.toLowerCase().includes(q);
         const inTags = q && m.tags.some(t => t.toLowerCase().includes(q));
-        
-        // 2. Associative Tag Match (Intersection)
-        // Check if any of the search tags exist in the memory tags
         const tagMatch = sTags.some(st => m.tags.some(mt => mt.toLowerCase().includes(st)));
-
         return inContent || inCategory || inTags || tagMatch;
       });
+
+      results.sort((a, b) => b.created_ms - a.created_ms);
       
-      // Sort: Tag matches generally more relevant than loose text matches
-      results.sort((a, b) => b.timestamp - a.timestamp);
+      if (results.length > 0) {
+          emitLog(`Search complete. ${results.length} relevant records identified.`, 'success');
+      } else {
+          emitLog("Search complete. No relevant records found.", 'info');
+      }
       
-      resolve(results.slice(0, 5));
-    };
-    request.onerror = () => reject('Search Error');
-  });
+      return results.slice(0, 5);
+  } catch (error: any) {
+      emitLog(`Search Protocol Failed: ${error.message}`, 'error');
+      return [];
+  }
 };
 
 export const formatMemoriesForPrompt = (memories: Memory[]): string => {
-  if (memories.length === 0) return "No relevant memory records found.";
-  
-  let output = "## РЕЛЕВАНТНЫЕ ЗАПИСИ ПАМЯТИ (ИЗВЛЕЧЕНО ПО ЗАПРОСУ):\n";
-  memories.forEach(m => {
-    output += `- [${m.category}] (${m.tags.join(', ')}): ${m.content}\n`;
-  });
-  return output;
+  if (!memories || memories.length === 0) return "No data available in archives.";
+  return memories.map(m => 
+    `[ARCHIVE:${m.id} | ${m.category}] ${m.content}`
+  ).join('\n');
 };
+        

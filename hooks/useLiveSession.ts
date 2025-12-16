@@ -4,7 +4,7 @@ import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type } f
 import { ConnectionState, LogEntry } from '../types';
 import { decodeBase64, pcmToAudioBuffer, float32ToPcmBlob, downsampleBuffer } from '../utils/audio-utils';
 import { HK47_SYSTEM_INSTRUCTION, getRandomThinkingPrompt } from './instructions';
-import { saveMemory, formatMemoriesForPrompt, searchMemories, getAllMemories } from '../utils/memory-db';
+import { saveMemory, formatMemoriesForPrompt, searchMemories, getAllMemories, subscribeToMemoryLogs } from '../utils/memory-db';
 import { contextManager } from '../utils/context-manager';
 
 const memoryToolDeclaration: FunctionDeclaration = {
@@ -65,14 +65,22 @@ export const useLiveSession = () => {
   // API Session
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
 
-  const addLog = (message: string, type: 'info' | 'error' | 'success' = 'info', sender: 'HK-47' | 'MEATBAG' = 'HK-47') => {
+  const addLog = useCallback((message: string, type: 'info' | 'error' | 'success' = 'info', sender: 'HK-47' | 'MEATBAG' = 'HK-47') => {
     setLogs(prev => [...prev.slice(-49), {
       timestamp: new Date().toLocaleTimeString(),
       sender,
       message,
       type
     }]);
-  };
+  }, []);
+
+  // Subscribe to Memory DB logs
+  useEffect(() => {
+    const unsubscribe = subscribeToMemoryLogs((message, type) => {
+       addLog(`[MEMORY CORE] ${message}`, type, 'HK-47');
+    });
+    return unsubscribe;
+  }, [addLog]);
 
   const playAudioChunk = useCallback((base64Data: string) => {
       if (!outputContextRef.current) return;
@@ -141,7 +149,7 @@ export const useLiveSession = () => {
     setVolume(0);
     setCurrentEmotion('neutral');
     addLog("Connection terminated.", 'info');
-  }, []);
+  }, [addLog]);
 
   const connect = useCallback(async () => {
     if (!process.env.API_KEY) {
@@ -213,10 +221,8 @@ export const useLiveSession = () => {
             
             // Initial Memory Dump
             try {
-                const allMemories = await getAllMemories();
-                if (allMemories.length > 0) {
-                    addLog(`MEMORY CHECK: ${allMemories.length} RECORDS FOUND.`, 'info', 'HK-47');
-                }
+                // Now handled via subscriptions logs, but we still trigger it
+                await getAllMemories();
             } catch (err) {
                 // Ignore silent fail on init
             }
@@ -421,7 +427,8 @@ export const useLiveSession = () => {
       addLog(`Initialization Failure: ${e.message}`, 'error');
       setStatus(ConnectionState.ERROR);
     }
-  }, [disconnect, playAudioChunk]);
+  }, [disconnect, playAudioChunk, addLog]);
 
   return { status, connect, disconnect, logs, volume, currentEmotion };
 };
+        
