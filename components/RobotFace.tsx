@@ -1,12 +1,14 @@
+
 import React, { useEffect, useState } from 'react';
 
 interface RobotFaceProps {
   emotion: string;
   isActive: boolean;
   volume: number; // 0 to 1
+  isRecording: boolean;
 }
 
-export const RobotFace: React.FC<RobotFaceProps> = ({ emotion, isActive, volume }) => {
+export const RobotFace: React.FC<RobotFaceProps> = ({ emotion, isActive, volume, isRecording }) => {
   // Eye transforms based on emotion
   const getEyeStyle = () => {
     // Base transformations
@@ -175,6 +177,18 @@ export const RobotFace: React.FC<RobotFaceProps> = ({ emotion, isActive, volume 
              </div>
         </div>
 
+      </div>
+
+      {/* Recording Status Indicator */}
+      <div className="absolute bottom-6 w-full flex justify-center items-center gap-2 z-20">
+        <div 
+          className={`w-2 h-2 rounded-full transition-colors duration-300 ${isRecording ? 'bg-green-500 shadow-[0_0_8px_#00ff00] animate-pulse' : 'bg-gray-800 border border-gray-700'}`} 
+        />
+        <span 
+          className={`text-[10px] font-mono tracking-widest transition-colors duration-300 ${isRecording ? 'text-green-500 drop-shadow-[0_0_5px_rgba(0,255,0,0.5)]' : 'text-gray-800'}`}
+        >
+          DATA_WRITE
+        </span>
       </div>
 
       {!isActive && (

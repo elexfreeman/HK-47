@@ -1,3 +1,4 @@
+
 import React, { useEffect, useRef } from 'react';
 import { useLiveSession } from './hooks/useLiveSession';
 import { Visualizer } from './components/Visualizer';
@@ -5,7 +6,7 @@ import { RobotFace } from './components/RobotFace';
 import { ConnectionState } from './types';
 
 const App: React.FC = () => {
-  const { status, connect, disconnect, logs, volume, currentEmotion } = useLiveSession();
+  const { status, connect, disconnect, logs, volume, currentEmotion, isRecording } = useLiveSession();
   const logContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -48,12 +49,17 @@ const App: React.FC = () => {
 
       {/* Main Content Area - Flex on Mobile, Grid on Desktop */}
       {/* min-h-0 is crucial for nested flex scrolling/sizing to work */}
-      <main className="flex-grow flex flex-col md:grid md:grid-cols-2 gap-2 min-h-0 z-10 mb-2">
+      <main className="flex-grow flex flex-col md:grid md:grid-cols-2 gap-2 min-h-0 z-10 mb-2 relative">
         
         {/* Face Panel: Grows to fill space on mobile */}
         <div className="flex-grow md:flex-auto relative border-2 border-red-900/50 bg-black/80 rounded-lg p-1 shadow-[0_0_30px_rgba(255,0,0,0.1)] overflow-hidden">
             <div className="absolute top-2 left-3 text-[10px] text-red-800 z-20">VISUAL RECEPTORS</div>
-            <RobotFace emotion={currentEmotion} isActive={isConnected} volume={volume} />
+            <RobotFace 
+              emotion={currentEmotion} 
+              isActive={isConnected} 
+              volume={volume} 
+              isRecording={isRecording}
+            />
         </div>
 
         {/* Visualizer & Controls Panel: Fixed height on mobile, full height on desktop */}

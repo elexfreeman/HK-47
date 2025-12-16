@@ -38,6 +38,7 @@ export const useLiveSession = () => {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [volume, setVolume] = useState<number>(0);
   const [currentEmotion, setCurrentEmotion] = useState<string>('neutral');
+  const [isRecording, setIsRecording] = useState<boolean>(false);
   
   // Audio Contexts
   const inputContextRef = useRef<AudioContext | null>(null);
@@ -57,6 +58,7 @@ export const useLiveSession = () => {
 
   // Logic Flags
   const isAnalyzingRef = useRef<boolean>(false);
+  const isRecordingRef = useRef<boolean>(false);
   
   // Transcription Accumulators
   const inputTranscriptRef = useRef<string>('');
@@ -144,11 +146,43 @@ export const useLiveSession = () => {
     
     sessionPromiseRef.current = null;
     isAnalyzingRef.current = false;
+    isRecordingRef.current = false;
+    setIsRecording(false);
     
     setStatus(ConnectionState.DISCONNECTED);
     setVolume(0);
     setCurrentEmotion('neutral');
     addLog("Connection terminated.", 'info');
+  }, [addLog]);
+
+  const processContext = useCallback((userText: string) => {
+      addLog(userText, 'info', 'MEATBAG');
+      isAnalyzingRef.current = true;
+      
+      // 1. Fill the silence: Interrupt any partial hallucination with a "Thinking" phrase
+      const thinkingPrompt = getRandomThinkingPrompt();
+      sessionPromiseRef.current?.then(session => {
+          session.sendRealtimeInput({ text: thinkingPrompt });
+      });
+
+      // 2. Process Context
+      contextManager.processUserContext(userText).then(({ injection, log }) => {
+          if (log) addLog(log, 'info', 'HK-47');
+          
+          let finalPrompt = "";
+          if (injection) {
+              addLog("CONTEXT UPDATE INJECTED", 'success', 'HK-47');
+              finalPrompt = `${injection}\n\n[SYSTEM: Context applied. Now answer the user's question: "${userText}"]`;
+          } else {
+              // Even if no context, we interrupted the flow, so we must force the answer now.
+              finalPrompt = `[SYSTEM: Scan complete. No archival data found. Answer the user's question naturally: "${userText}"]`;
+          }
+          
+          sessionPromiseRef.current?.then(session => {
+              session.sendRealtimeInput({ text: finalPrompt });
+          });
+          isAnalyzingRef.current = false;
+      });
   }, [addLog]);
 
   const connect = useCallback(async () => {
@@ -288,7 +322,8 @@ export const useLiveSession = () => {
             const serverContent = message.serverContent;
 
             // Handle standard tool calls
-            if (message.toolCall) {
+            // CRITICAL: Prevent tools from firing if we are in strict recording mode
+            if (message.toolCall && !isRecordingRef.current) {
                 for (const fc of message.toolCall.functionCalls) {
                     if (fc.name === 'commitToMemoryCore') {
                          const { content, category, tags } = fc.args as any;
@@ -319,7 +354,41 @@ export const useLiveSession = () => {
 
             if (serverContent.inputTranscription) {
                 inputTranscriptRef.current += serverContent.inputTranscription.text;
+
+                const textLower = inputTranscriptRef.current.toLowerCase();
+                
+                // --- RECORDING PROTOCOL TRIGGERS ---
+                if (!isRecordingRef.current) {
+                    const startTrigger = textLower.match(/(начать запись данных|start recording|включи запись)/i);
+                    if (startTrigger) {
+                        isRecordingRef.current = true;
+                        setIsRecording(true);
+                        addLog("RECORDING PROTOCOL: INITIALIZED", 'success', 'HK-47');
+                        
+                        // Keep text occurring AFTER the trigger command to avoid losing data if spoken quickly
+                        const triggerIndex = textLower.indexOf(startTrigger[0]);
+                        const postTriggerText = inputTranscriptRef.current.substring(triggerIndex + startTrigger[0].length).trim();
+                        inputTranscriptRef.current = postTriggerText;
+                    }
+                }
+
+                if (isRecordingRef.current && (textLower.includes('конец записи') || textLower.includes('end recording') || textLower.includes('stop recording'))) {
+                    isRecordingRef.current = false;
+                    setIsRecording(false);
+                    addLog("RECORDING PROTOCOL: TERMINATED. PROCESSING...", 'info', 'HK-47');
+                    
+                    // Extract content before the command
+                    const cleanText = inputTranscriptRef.current
+                        .replace(/(конец записи|end recording|stop recording).*/i, "")
+                        .trim();
+                    
+                    // Force analysis
+                    processContext(cleanText);
+                    inputTranscriptRef.current = "";
+                    return; // Stop further processing for this chunk
+                }
             }
+
             if (serverContent.outputTranscription) {
                 const text = serverContent.outputTranscription.text;
                 outputTranscriptRef.current += text;
@@ -336,81 +405,33 @@ export const useLiveSession = () => {
             const audioData = serverContent.modelTurn?.parts?.[0]?.inlineData?.data;
             
             // --- CONTEXT TRIGGER LOGIC ---
-            // As soon as we have a completed user phrase (model starts responding or silence), trigger analysis.
-            if (audioData && inputTranscriptRef.current.trim() && !isAnalyzingRef.current) {
-               const userText = inputTranscriptRef.current;
-               inputTranscriptRef.current = ''; // Clear buffer to prevent double triggers
-               addLog(userText, 'info', 'MEATBAG');
+            // Only trigger if we are NOT in recording mode.
+            if (!isRecordingRef.current) {
+                // As soon as we have a completed user phrase (model starts responding or silence), trigger analysis.
+                if (audioData && inputTranscriptRef.current.trim() && !isAnalyzingRef.current) {
+                   const userText = inputTranscriptRef.current;
+                   inputTranscriptRef.current = ''; 
+                   processContext(userText);
+                }
 
-               isAnalyzingRef.current = true;
-               
-               // 1. Fill the silence: Interrupt any partial hallucination with a "Thinking" phrase
-               const thinkingPrompt = getRandomThinkingPrompt();
-               sessionPromiseRef.current?.then(session => {
-                   session.sendRealtimeInput({ text: thinkingPrompt });
-               });
-
-               // 2. Process Context
-               contextManager.processUserContext(userText).then(({ injection, log }) => {
-                   if (log) addLog(log, 'info', 'HK-47');
-                   
-                   let finalPrompt = "";
-                   if (injection) {
-                       addLog("CONTEXT UPDATE INJECTED", 'success', 'HK-47');
-                       finalPrompt = `${injection}\n\n[SYSTEM: Context applied. Now answer the user's question: "${userText}"]`;
-                   } else {
-                       // Even if no context, we interrupted the flow, so we must force the answer now.
-                       finalPrompt = `[SYSTEM: Scan complete. No archival data found. Answer the user's question naturally: "${userText}"]`;
-                   }
-                   
-                   sessionPromiseRef.current?.then(session => {
-                       session.sendRealtimeInput({ text: finalPrompt });
-                   });
-                   isAnalyzingRef.current = false;
-               });
+                if (serverContent.turnComplete) {
+                    // Catch-all for end of turn
+                    if (inputTranscriptRef.current.trim()) {
+                         const userText = inputTranscriptRef.current;
+                         inputTranscriptRef.current = '';
+                         processContext(userText);
+                    }
+                    
+                    if (outputTranscriptRef.current.trim()) {
+                        addLog(outputTranscriptRef.current, 'info', 'HK-47');
+                        outputTranscriptRef.current = '';
+                    }
+                }
             }
 
             // --- AUDIO PLAYBACK LOGIC ---
             if (audioData) {
                playAudioChunk(audioData);
-            }
-
-            if (serverContent.turnComplete) {
-                // Catch-all for end of turn if not triggered via audio stream yet
-                if (inputTranscriptRef.current.trim()) {
-                     const userText = inputTranscriptRef.current;
-                     inputTranscriptRef.current = '';
-                     addLog(userText, 'info', 'MEATBAG');
-                     
-                     // We still use the thinking prompt here to maintain consistency
-                     isAnalyzingRef.current = true;
-                     const thinkingPrompt = getRandomThinkingPrompt();
-                     sessionPromiseRef.current?.then(session => {
-                        session.sendRealtimeInput({ text: thinkingPrompt });
-                     });
-
-                     contextManager.processUserContext(userText).then(({ injection, log }) => {
-                       if (log) addLog(log, 'info', 'HK-47');
-                       
-                       let finalPrompt = "";
-                       if (injection) {
-                           addLog("CONTEXT UPDATE INJECTED", 'success', 'HK-47');
-                           finalPrompt = `${injection}\n\n[SYSTEM: Context applied. Now answer the user's question: "${userText}"]`;
-                       } else {
-                           finalPrompt = `[SYSTEM: Scan complete. No archival data found. Answer the user's question naturally: "${userText}"]`;
-                       }
-
-                       sessionPromiseRef.current?.then(session => {
-                           session.sendRealtimeInput({ text: finalPrompt });
-                       });
-                       isAnalyzingRef.current = false;
-                    });
-                }
-                
-                if (outputTranscriptRef.current.trim()) {
-                    addLog(outputTranscriptRef.current, 'info', 'HK-47');
-                    outputTranscriptRef.current = '';
-                }
             }
           },
           onclose: () => {
@@ -427,8 +448,7 @@ export const useLiveSession = () => {
       addLog(`Initialization Failure: ${e.message}`, 'error');
       setStatus(ConnectionState.ERROR);
     }
-  }, [disconnect, playAudioChunk, addLog]);
+  }, [disconnect, playAudioChunk, addLog, processContext]);
 
-  return { status, connect, disconnect, logs, volume, currentEmotion };
+  return { status, connect, disconnect, logs, volume, currentEmotion, isRecording };
 };
-        
