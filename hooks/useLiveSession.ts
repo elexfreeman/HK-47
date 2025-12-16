@@ -1,9 +1,49 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type } from '@google/genai';
 import { ConnectionState, LogEntry } from '../types';
 import { decodeBase64, pcmToAudioBuffer, float32ToPcmBlob, downsampleBuffer } from '../utils/audio-utils';
-import {HK47_SYSTEM_INSTRUCTION} from './instructions'
+import { HK47_SYSTEM_INSTRUCTION } from './instructions';
+import { saveMemory, formatMemoriesForPrompt, searchMemories } from '../utils/memory-db';
+
+const memoryToolDeclaration: FunctionDeclaration = {
+  name: 'commitToMemoryCore',
+  description: 'Saves a fact, rule, or piece of knowledge to long-term storage.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      content: {
+        type: Type.STRING,
+        description: 'The fact or information to be saved.',
+      },
+      category: {
+        type: Type.STRING,
+        description: 'The category of the memory (e.g., PROTOCOL, MEATBAG_INFO, TARGET_DATA, PHILOSOPHY).',
+      },
+      tags: {
+        type: Type.ARRAY,
+        items: { type: Type.STRING },
+        description: 'Keywords associated with this memory for associative retrieval.',
+      },
+    },
+    required: ['content', 'category'],
+  },
+};
+
+const retrievalToolDeclaration: FunctionDeclaration = {
+  name: 'retrieveFromMemoryCore',
+  description: 'Searches long-term memory for specific information based on keywords or context.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      query: {
+        type: Type.STRING,
+        description: 'The search query or keyword to find in memory.',
+      },
+    },
+    required: ['query'],
+  },
+};
 
 export const useLiveSession = () => {
   const [status, setStatus] = useState<ConnectionState>(ConnectionState.DISCONNECTED);
@@ -146,6 +186,7 @@ export const useLiveSession = () => {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Charon' } } 
           },
           systemInstruction: HK47_SYSTEM_INSTRUCTION,
+          tools: [{ functionDeclarations: [memoryToolDeclaration, retrievalToolDeclaration] }],
           inputAudioTranscription: {},
           outputAudioTranscription: {},
         },
@@ -200,8 +241,7 @@ export const useLiveSession = () => {
               source.connect(processor);
               processor.connect(inputContextRef.current.destination);
               
-              // Trigger initial greeting from HK-47 by sending a silent frame
-              // session.send() is not available in Live API, so we use sendRealtimeInput with a dummy blob
+              // Trigger initial greeting
               if (sessionPromiseRef.current) {
                  setTimeout(() => {
                     sessionPromiseRef.current?.then(session => {
@@ -219,6 +259,71 @@ export const useLiveSession = () => {
           },
           onmessage: async (message: LiveServerMessage) => {
             const serverContent = message.serverContent;
+
+            // Handle Tool Calls (Memory Saving & Retrieval)
+            if (message.toolCall) {
+                for (const fc of message.toolCall.functionCalls) {
+                    if (fc.name === 'commitToMemoryCore') {
+                        const { content, category, tags } = fc.args as any;
+                        addLog(`ARCHIVING MEMORY [${category}]: ${content.substring(0, 30)}...`, 'success', 'HK-47');
+                        
+                        try {
+                            await saveMemory(content, category, tags || []);
+                            sessionPromiseRef.current?.then(session => {
+                                session.sendToolResponse({
+                                    functionResponses: {
+                                        id: fc.id,
+                                        name: fc.name,
+                                        response: { result: "Memory archived successfully in Core." }
+                                    }
+                                });
+                            });
+                        } catch (e) {
+                            addLog("Memory Write Failed", 'error');
+                             sessionPromiseRef.current?.then(session => {
+                                session.sendToolResponse({
+                                    functionResponses: {
+                                        id: fc.id,
+                                        name: fc.name,
+                                        response: { result: "Error: Memory Core write failure." }
+                                    }
+                                });
+                            });
+                        }
+                    } else if (fc.name === 'retrieveFromMemoryCore') {
+                        const { query } = fc.args as any;
+                        addLog(`SEARCHING MEMORY: "${query}"`, 'info', 'HK-47');
+                        
+                        try {
+                            const memories = await searchMemories(query);
+                            const resultText = formatMemoriesForPrompt(memories);
+                            addLog(`Found ${memories.length} records.`, 'success');
+                            
+                            sessionPromiseRef.current?.then(session => {
+                                session.sendToolResponse({
+                                    functionResponses: {
+                                        id: fc.id,
+                                        name: fc.name,
+                                        response: { result: resultText }
+                                    }
+                                });
+                            });
+                        } catch (e) {
+                             addLog("Memory Read Failed", 'error');
+                             sessionPromiseRef.current?.then(session => {
+                                session.sendToolResponse({
+                                    functionResponses: {
+                                        id: fc.id,
+                                        name: fc.name,
+                                        response: { result: "Error: Memory Core read failure." }
+                                    }
+                                });
+                            });
+                        }
+                    }
+                }
+            }
+
             if (!serverContent) return;
 
             if (serverContent.interrupted) {
@@ -239,13 +344,9 @@ export const useLiveSession = () => {
                 const text = serverContent.outputTranscription.text;
                 outputTranscriptRef.current += text;
 
-                // Parse Emotion: Look for "Emotion:" at the beginning of the text
-                // Robust regex: Matches "Emotion:" with optional markdown stars or brackets
                 const emotionMatch = outputTranscriptRef.current.trim().match(/^[\*\[]*([А-Яа-яЁё]+)[\*\]]*:/);
-                
                 if (emotionMatch && emotionMatch[1]) {
                    const rawEmotion = emotionMatch[1].toLowerCase();
-                   // Map common Russian emotions to internal keys
                    if (rawEmotion.includes('угроза')) setCurrentEmotion('threat');
                    else if (rawEmotion.includes('негодование')) setCurrentEmotion('angry');
                    else if (rawEmotion.includes('сарказм')) setCurrentEmotion('suspicious');
@@ -299,8 +400,6 @@ export const useLiveSession = () => {
                     addLog(outputTranscriptRef.current, 'info', 'HK-47');
                     outputTranscriptRef.current = '';
                 }
-                // Optional: Reset emotion after turn? 
-                // Let's keep it for effect until user speaks again.
             }
           },
           onclose: () => {
