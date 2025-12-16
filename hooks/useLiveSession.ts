@@ -4,7 +4,7 @@ import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type } f
 import { ConnectionState, LogEntry } from '../types';
 import { decodeBase64, pcmToAudioBuffer, float32ToPcmBlob, downsampleBuffer } from '../utils/audio-utils';
 import { HK47_SYSTEM_INSTRUCTION } from './instructions';
-import { saveMemory, formatMemoriesForPrompt, searchMemories } from '../utils/memory-db';
+import { saveMemory, formatMemoriesForPrompt, searchMemories, getAllMemories } from '../utils/memory-db';
 
 const memoryToolDeclaration: FunctionDeclaration = {
   name: 'commitToMemoryCore',
@@ -194,6 +194,23 @@ export const useLiveSession = () => {
           onopen: async () => {
             setStatus(ConnectionState.CONNECTED);
             addLog("Connection established. Assassination protocols active.", 'success');
+            
+            // --- MEMORY CORE DUMP START ---
+            try {
+                const allMemories = await getAllMemories();
+                if (allMemories.length > 0) {
+                    addLog(`INITIATING MEMORY CORE DUMP... [${allMemories.length} RECORDS FOUND]`, 'info', 'HK-47');
+                    allMemories.forEach(mem => {
+                         addLog(`[${mem.category.toUpperCase()}] ${mem.content}`, 'info', 'HK-47');
+                    });
+                    addLog("MEMORY CORE DUMP COMPLETE.", 'success', 'HK-47');
+                } else {
+                    addLog("MEMORY CORE STATUS: EMPTY. TABULA RASA PROTOCOLS ACTIVE.", 'info', 'HK-47');
+                }
+            } catch (err) {
+                addLog(`MEMORY CORE ACCESS FAILURE: ${err}`, 'error');
+            }
+            // --- MEMORY CORE DUMP END ---
 
             // Start Microphone Stream
             try {
