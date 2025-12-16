@@ -3,11 +3,10 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type } from '@google/genai';
 import { ConnectionState, LogEntry } from '../types';
 import { decodeBase64, pcmToAudioBuffer, float32ToPcmBlob, downsampleBuffer } from '../utils/audio-utils';
-import { HK47_SYSTEM_INSTRUCTION } from './instructions';
+import { HK47_SYSTEM_INSTRUCTION, getRandomThinkingPrompt } from './instructions';
 import { saveMemory, formatMemoriesForPrompt, searchMemories, getAllMemories } from '../utils/memory-db';
 import { contextManager } from '../utils/context-manager';
 
-// We keep tools as a fallback, but the ContextManager handles most proactive logic now.
 const memoryToolDeclaration: FunctionDeclaration = {
   name: 'commitToMemoryCore',
   description: 'Saves a fact, rule, or piece of knowledge to long-term storage.',
@@ -56,6 +55,9 @@ export const useLiveSession = () => {
   const nextStartTimeRef = useRef<number>(0);
   const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
 
+  // Logic Flags
+  const isAnalyzingRef = useRef<boolean>(false);
+  
   // Transcription Accumulators
   const inputTranscriptRef = useRef<string>('');
   const outputTranscriptRef = useRef<string>('');
@@ -71,6 +73,38 @@ export const useLiveSession = () => {
       type
     }]);
   };
+
+  const playAudioChunk = useCallback((base64Data: string) => {
+      if (!outputContextRef.current) return;
+      const ctx = outputContextRef.current;
+      
+      try {
+          const rawBytes = decodeBase64(base64Data);
+          const audioBuffer = pcmToAudioBuffer(rawBytes, ctx, 24000); 
+          
+          // Ensure we don't schedule in the past
+          nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+          
+          const source = ctx.createBufferSource();
+          source.buffer = audioBuffer;
+          
+          if (effectInputRef.current) {
+               source.connect(effectInputRef.current);
+          } else {
+               source.connect(ctx.destination);
+          }
+          
+          source.onended = () => {
+            audioSourcesRef.current.delete(source);
+          };
+          source.start(nextStartTimeRef.current);
+          audioSourcesRef.current.add(source);
+
+          nextStartTimeRef.current += audioBuffer.duration;
+      } catch (e) {
+          console.error("Audio playback error", e);
+      }
+  }, []);
 
   const disconnect = useCallback(() => {
     if (processorRef.current) {
@@ -101,6 +135,8 @@ export const useLiveSession = () => {
     audioSourcesRef.current.clear();
     
     sessionPromiseRef.current = null;
+    isAnalyzingRef.current = false;
+    
     setStatus(ConnectionState.DISCONNECTED);
     setVolume(0);
     setCurrentEmotion('neutral');
@@ -245,19 +281,17 @@ export const useLiveSession = () => {
           onmessage: async (message: LiveServerMessage) => {
             const serverContent = message.serverContent;
 
-            // Handle standard tool calls (Fallback if HK-47 triggers them manually)
+            // Handle standard tool calls
             if (message.toolCall) {
                 for (const fc of message.toolCall.functionCalls) {
                     if (fc.name === 'commitToMemoryCore') {
                          const { content, category, tags } = fc.args as any;
-                         // Manual save by HK-47
                          addLog(`MANUAL ARCHIVE [${category}]: ${content.substring(0, 30)}...`, 'success', 'HK-47');
                          await saveMemory(content, category, tags || []);
                          sessionPromiseRef.current?.then(s => s.sendToolResponse({
                              functionResponses: { id: fc.id, name: fc.name, response: { result: "Confirmed." } }
                          }));
                     } else if (fc.name === 'retrieveFromMemoryCore') {
-                        // Manual retrieve
                         const { query } = fc.args as any;
                         const memories = await searchMemories(query);
                         const result = formatMemoriesForPrompt(memories);
@@ -283,7 +317,6 @@ export const useLiveSession = () => {
             if (serverContent.outputTranscription) {
                 const text = serverContent.outputTranscription.text;
                 outputTranscriptRef.current += text;
-                // Emotion detection logic (abbreviated for clarity, same as before)
                 const emotionMatch = outputTranscriptRef.current.trim().match(/^[\*\[]*([А-Яа-яЁё]+)[\*\]]*:/);
                 if (emotionMatch && emotionMatch[1]) {
                     const em = emotionMatch[1].toLowerCase();
@@ -295,65 +328,79 @@ export const useLiveSession = () => {
             }
 
             const audioData = serverContent.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (audioData) {
-               // If audio is coming, user turn is definitely over.
-               // Process Context Manager if we have input transcript pending analysis.
-               if (inputTranscriptRef.current.trim()) {
-                   const userText = inputTranscriptRef.current;
-                   inputTranscriptRef.current = ''; // Clear buffer
-                   addLog(userText, 'info', 'MEATBAG');
+            
+            // --- CONTEXT TRIGGER LOGIC ---
+            // As soon as we have a completed user phrase (model starts responding or silence), trigger analysis.
+            if (audioData && inputTranscriptRef.current.trim() && !isAnalyzingRef.current) {
+               const userText = inputTranscriptRef.current;
+               inputTranscriptRef.current = ''; // Clear buffer to prevent double triggers
+               addLog(userText, 'info', 'MEATBAG');
 
-                   // --- CONTEXT MANAGER EXECUTION ---
-                   // We run this asynchronously. If it finds something, we inject it.
-                   contextManager.processUserContext(userText).then(({ injection, log }) => {
-                       if (log) {
-                           addLog(log, 'info', 'HK-47');
-                       }
-                       if (injection) {
-                           addLog("CONTEXT UPDATE INJECTED", 'success', 'HK-47');
-                           sessionPromiseRef.current?.then(session => {
-                               session.sendRealtimeInput({ text: injection });
-                           });
-                       }
+               isAnalyzingRef.current = true;
+               
+               // 1. Fill the silence: Interrupt any partial hallucination with a "Thinking" phrase
+               const thinkingPrompt = getRandomThinkingPrompt();
+               sessionPromiseRef.current?.then(session => {
+                   session.sendRealtimeInput({ text: thinkingPrompt });
+               });
+
+               // 2. Process Context
+               contextManager.processUserContext(userText).then(({ injection, log }) => {
+                   if (log) addLog(log, 'info', 'HK-47');
+                   
+                   let finalPrompt = "";
+                   if (injection) {
+                       addLog("CONTEXT UPDATE INJECTED", 'success', 'HK-47');
+                       finalPrompt = `${injection}\n\n[SYSTEM: Context applied. Now answer the user's question: "${userText}"]`;
+                   } else {
+                       // Even if no context, we interrupted the flow, so we must force the answer now.
+                       finalPrompt = `[SYSTEM: Scan complete. No archival data found. Answer the user's question naturally: "${userText}"]`;
+                   }
+                   
+                   sessionPromiseRef.current?.then(session => {
+                       session.sendRealtimeInput({ text: finalPrompt });
                    });
-                   // --------------------------------
-               }
+                   isAnalyzingRef.current = false;
+               });
+            }
 
-               if (outputContextRef.current) {
-                   const ctx = outputContextRef.current;
-                   const rawBytes = decodeBase64(audioData);
-                   const audioBuffer = pcmToAudioBuffer(rawBytes, ctx, 24000); 
-                   nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-                   const source = ctx.createBufferSource();
-                   source.buffer = audioBuffer;
-                   if (effectInputRef.current) source.connect(effectInputRef.current);
-                   else source.connect(ctx.destination);
-                   source.onended = () => audioSourcesRef.current.delete(source);
-                   source.start(nextStartTimeRef.current);
-                   audioSourcesRef.current.add(source);
-                   nextStartTimeRef.current += audioBuffer.duration;
-               }
+            // --- AUDIO PLAYBACK LOGIC ---
+            if (audioData) {
+               playAudioChunk(audioData);
             }
 
             if (serverContent.turnComplete) {
+                // Catch-all for end of turn if not triggered via audio stream yet
                 if (inputTranscriptRef.current.trim()) {
-                    // Final catch for turn complete
-                    const userText = inputTranscriptRef.current;
-                    inputTranscriptRef.current = '';
-                    addLog(userText, 'info', 'MEATBAG');
+                     const userText = inputTranscriptRef.current;
+                     inputTranscriptRef.current = '';
+                     addLog(userText, 'info', 'MEATBAG');
+                     
+                     // We still use the thinking prompt here to maintain consistency
+                     isAnalyzingRef.current = true;
+                     const thinkingPrompt = getRandomThinkingPrompt();
+                     sessionPromiseRef.current?.then(session => {
+                        session.sendRealtimeInput({ text: thinkingPrompt });
+                     });
 
-                    contextManager.processUserContext(userText).then(({ injection, log }) => {
-                       if (log) {
-                           addLog(log, 'info', 'HK-47');
-                       }
+                     contextManager.processUserContext(userText).then(({ injection, log }) => {
+                       if (log) addLog(log, 'info', 'HK-47');
+                       
+                       let finalPrompt = "";
                        if (injection) {
                            addLog("CONTEXT UPDATE INJECTED", 'success', 'HK-47');
-                           sessionPromiseRef.current?.then(session => {
-                               session.sendRealtimeInput({ text: injection });
-                           });
+                           finalPrompt = `${injection}\n\n[SYSTEM: Context applied. Now answer the user's question: "${userText}"]`;
+                       } else {
+                           finalPrompt = `[SYSTEM: Scan complete. No archival data found. Answer the user's question naturally: "${userText}"]`;
                        }
+
+                       sessionPromiseRef.current?.then(session => {
+                           session.sendRealtimeInput({ text: finalPrompt });
+                       });
+                       isAnalyzingRef.current = false;
                     });
                 }
+                
                 if (outputTranscriptRef.current.trim()) {
                     addLog(outputTranscriptRef.current, 'info', 'HK-47');
                     outputTranscriptRef.current = '';
@@ -374,7 +421,7 @@ export const useLiveSession = () => {
       addLog(`Initialization Failure: ${e.message}`, 'error');
       setStatus(ConnectionState.ERROR);
     }
-  }, [disconnect]);
+  }, [disconnect, playAudioChunk]);
 
   return { status, connect, disconnect, logs, volume, currentEmotion };
 };
