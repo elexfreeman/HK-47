@@ -4,7 +4,7 @@ import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type } f
 import { ConnectionState, LogEntry } from '../types';
 import { decodeBase64, pcmToAudioBuffer, float32ToPcmBlob, downsampleBuffer } from '../utils/audio-utils';
 import { HK47_SYSTEM_INSTRUCTION, getRandomThinkingPrompt } from './instructions';
-import { saveMemory, formatMemoriesForPrompt, searchMemories, getAllMemories, subscribeToMemoryLogs } from '../utils/memory-db';
+import { saveMemory, formatMemoriesForPrompt, searchMemories, getAllMemories, subscribeToMemoryLogs, db } from '../utils/memory-db';
 import { contextManager } from '../utils/context-manager';
 
 // --- ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ (TOOLS) ---
@@ -203,6 +203,7 @@ export const useLiveSession = () => {
     }
 
     try {
+      await db.connect();
       setStatus(ConnectionState.CONNECTING);
       addLog("Initializing audio protocols...", 'info');
 

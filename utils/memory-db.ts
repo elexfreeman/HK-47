@@ -10,8 +10,8 @@ export interface Memory {
 // Configuration
 const DB_URL = process.env.HK_DB_URL || 'wss://some-network.ru/ws';
 const DB_USER = process.env.HK_DB_USER || 'admin';
-const DB_PASS = process.env.HK_DB_PASS || 'password';
-const PARTITION = 'dev-db';
+const DB_PASS = process.env.HK_DB_PASS || 'qehjdfh746@yrh1';
+const PARTITION = 'hk47';
 
 // --- Logging System ---
 type LogCallback = (message: string, type: 'info' | 'error' | 'success') => void;
@@ -43,7 +43,8 @@ class MemoryDBClient {
 
   constructor() {}
 
-  private async connect(): Promise<void> {
+  async connect(): Promise<void> {
+    emitLog("Try connect to Memory Core...", 'info');
     if (this.ws && this.ws.readyState === WebSocket.OPEN && this.isAuthenticated) {
       return;
     }
@@ -238,7 +239,7 @@ class MemoryDBClient {
   }
 }
 
-const db = new MemoryDBClient();
+export const db = new MemoryDBClient();
 
 // --- Exported Helper Functions ---
 
